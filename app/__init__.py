@@ -1,0 +1,1 @@
+"""FastMCP Gateway Application Package."""

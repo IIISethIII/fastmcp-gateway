@@ -1,0 +1,38 @@
+# mcp-email-server legacy TOML configuration (IMAP-only, read-only)
+# Two example accounts: a private mailbox (user = full address) and a TUM mailbox via LRZ (xmail.mwn.de, user = TUM-LRZ-ID)
+allowed_recipients = []
+allowed_senders = []
+credential_storage = "plaintext"
+enable_attachment_download = false
+enable_attachment_content = false
+report_blocked_mutations = false
+
+[[emails]]
+account_name = "personal"
+description = "Private mailbox"
+email_address = "you@example.com"
+full_name = "Your Name"
+
+[emails.incoming]
+user_name = "you@example.com"
+password = "CHANGE_ME"
+host = "imap.example.com"
+port = 993
+use_ssl = true
+start_ssl = false
+verify_ssl = true
+
+[[emails]]
+account_name = "tum"
+description = "TUM exchange mailbox via LRZ MWN mail (user = TUM-LRZ-ID like p123abc, NOT the email address)"
+email_address = "you@tum.de"
+full_name = "Your Name"
+
+[emails.incoming]
+user_name = "ab12cde"
+password = "CHANGE_ME"
+host = "xmail.mwn.de"
+port = 993
+use_ssl = true
+start_ssl = false
+verify_ssl = true

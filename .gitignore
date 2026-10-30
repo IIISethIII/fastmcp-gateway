@@ -1,0 +1,15 @@
+# Secrets
+.env
+email-mcp/config.toml
+searxng/settings.yml
+searxng/settings.yml.new
+
+# Runtime OAuth / API tokens
+workspace-tokens/
+music-tokens/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/

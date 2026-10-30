@@ -1,0 +1,236 @@
+services:
+  fastmcp-gateway:
+    build: .
+    container_name: fastmcp-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - traefik-proxy
+      # Bridge to the google-health-mcp sub-server (private health-internal network)
+      - health-internal
+      # Bridge to the browser-mcp sub-server (private browser-internal network)
+      - browser-internal
+    volumes:
+      # OAuth 2.1 client tokens (written by scripts/google_oauth_bootstrap.py, read by the gateway).
+      # IMPORTANT: must be mounted at the SAME in-container path as the bootstrap uses
+      # (FileTreeStore persists absolute collection directories in its info files).
+      - ./workspace-tokens:/workspace-tokens
+      # Spotify user token for the music tools (written by scripts/spotify_auth.py)
+      - ./music-tokens:/music-tokens
+    labels:
+      - "traefik.enable=true"
+      # Local HTTP routing
+      - "traefik.http.routers.fastmcp-local.rule=Host(`mcp.local`)"
+      - "traefik.http.routers.fastmcp-local.entrypoints=web"
+      - "traefik.http.routers.fastmcp-local.service=fastmcp-svc"
+      # External HTTPS routing
+      - "traefik.http.routers.fastmcp-secure.rule=Host(`${GATEWAY_DOMAIN:?set GATEWAY_DOMAIN in .env}`)"
+      - "traefik.http.routers.fastmcp-secure.entrypoints=websecure"
+      - "traefik.http.routers.fastmcp-secure.tls=true"
+      - "traefik.http.routers.fastmcp-secure.tls.certresolver=myresolver"
+      - "traefik.http.routers.fastmcp-secure.service=fastmcp-svc"
+      # Common Service
+      - "traefik.http.services.fastmcp-svc.loadbalancer.server.port=8000"
+
+  workspace-mcp:
+    build: ./workspace-mcp
+    container_name: workspace-mcp
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - traefik-proxy
+    environment:
+      # Public OAuth base URL: advertised as RFC 8707 protected resource and issuer,
+      # and used to build the Google callback (https://<GWS_DOMAIN>/oauth2callback)
+      - WORKSPACE_EXTERNAL_URL=https://${GWS_DOMAIN}
+      - FASTMCP_SERVER_AUTH_GOOGLE_BASE_URL=https://${GWS_DOMAIN}
+      - WORKSPACE_MCP_ALLOWED_CLIENT_REDIRECT_URIS=${WORKSPACE_MCP_ALLOWED_CLIENT_REDIRECT_URIS:-http://localhost:*/callback,http://mcp.local:*/callback}
+    volumes:
+      - ./workspace-tokens:/app/tokens
+    # Host port needed once for the OAuth 2.1 bootstrap flow (scripts/google_oauth_bootstrap.py)
+    ports:
+      - "127.0.0.1:8765:8765"
+    labels:
+      - "traefik.enable=true"
+      # Public HTTPS host for the OAuth 2.1 browser flow (authorize/token/discovery
+      # endpoints must be reachable by browsers and clients).
+      # NOTE: gws.local must NOT be in the TLS router — Let's Encrypt rejects .local
+      # identifiers and fails the whole cert request.
+      - "traefik.http.routers.ws-mcp-gws.rule=Host(`${GWS_DOMAIN:?set GWS_DOMAIN in .env}`)"
+      - "traefik.http.routers.ws-mcp-gws.entrypoints=websecure"
+      - "traefik.http.routers.ws-mcp-gws.tls=true"
+      - "traefik.http.routers.ws-mcp-gws.tls.certresolver=myresolver"
+      - "traefik.http.routers.ws-mcp-gws.service=ws-mcp-svc"
+      - "traefik.http.routers.ws-mcp-gws-local.rule=Host(`gws.local`)"
+      - "traefik.http.routers.ws-mcp-gws-local.entrypoints=web"
+      - "traefik.http.routers.ws-mcp-gws-local.service=ws-mcp-svc"
+      # OAuth2 callback route (Google redirects here)
+      - "traefik.http.routers.ws-mcp-oauth.rule=Host(`mcp.local`) && PathPrefix(`/oauth2callback`)"
+      - "traefik.http.routers.ws-mcp-oauth.entrypoints=web"
+      - "traefik.http.routers.ws-mcp-oauth.service=ws-mcp-svc"
+      - "traefik.http.routers.ws-mcp-oauth-secure.rule=Host(`${GATEWAY_DOMAIN:?set GATEWAY_DOMAIN in .env}`) && PathPrefix(`/oauth2callback`)"
+      - "traefik.http.routers.ws-mcp-oauth-secure.entrypoints=websecure"
+      - "traefik.http.routers.ws-mcp-oauth-secure.tls=true"
+      - "traefik.http.routers.ws-mcp-oauth-secure.tls.certresolver=myresolver"
+      - "traefik.http.routers.ws-mcp-oauth-secure.service=ws-mcp-svc"
+      - "traefik.http.services.ws-mcp-svc.loadbalancer.server.port=8765"
+
+  # Home Assistant MCP sub-server (proxied by the gateway under the `ha_` prefix).
+  # Pointed at HAOS (Proxmox VM) via HOMEASSISTANT_URL + long-lived access token from .env.
+  ha-mcp:
+    # pinned to the digest running on 2026-10-12 (was :latest)
+    image: ghcr.io/homeassistant-ai/ha-mcp@sha256:7426fb169440aff789e4ee942012b03317ba0b68e1d463efa19c37088dddd8bc
+    container_name: ha-mcp
+    restart: unless-stopped
+    command: ["ha-mcp-web"]
+    env_file:
+      - .env
+    environment:
+      - HOMEASSISTANT_URL=${HOMEASSISTANT_URL}
+      - HOMEASSISTANT_TOKEN=${HOMEASSISTANT_TOKEN}
+    volumes:
+      - ha-mcp-data:/home/mcpuser/.ha-mcp
+    networks:
+      - traefik-proxy
+
+  # Email MCP sub-server (mcp-email-server, proxied by the gateway under the `mail_` prefix).
+  # IMAP-only, read-only (legacy TOML accounts, allowed_mutations = []).
+  # Account config: ./email-mcp/config.toml (mount read-only) — edit real passwords there.
+  email-mcp:
+    image: ghcr.io/wh1isper/mcp-email-server:1.6.2
+    container_name: email-mcp
+    restart: unless-stopped
+    command: ["streamable-http"]
+    env_file:
+      - ./email-mcp/email-mcp.env
+    volumes:
+      - ./email-mcp/config.toml:/config/config.toml:ro
+    networks:
+      - traefik-proxy
+
+  searxng:
+    # pinned to the digest running on 2026-10-12 (was :latest)
+    image: searxng/searxng@sha256:ddd642cae6eac75412938fd846ddbf440a2df029cfeae8a562b8b205f4e35e25
+    container_name: searxng
+    restart: unless-stopped
+    networks:
+      - traefik-proxy
+    volumes:
+      - ./searxng:/etc/searxng
+    environment:
+      - SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.searxng.rule=Host(`search.local`)"
+      - "traefik.http.routers.searxng.entrypoints=web"
+      - "traefik.http.services.searxng.loadbalancer.server.port=8080"
+      - "traefik.http.routers.searxng.middlewares=searxng-headers"
+      - "traefik.http.middlewares.searxng-headers.headers.customrequestheaders.X-Forwarded-For=true"
+
+  # Vinted MCP sub-server (@googlarz/vinted-client, proxied by the gateway under
+  # the `vinted` namespace -> tools as vinted_search_items, ...).
+  # No Traefik labels: reachable only from the gateway over the internal docker
+  # network, and protected by a bearer token (VINTED_MCP_TOKEN from .env).
+  vinted-mcp:
+    build: ./vinted-mcp
+    container_name: vinted-mcp
+    restart: unless-stopped
+    environment:
+      - VINTED_MCP_TOKEN=${VINTED_MCP_TOKEN}
+    networks:
+      - traefik-proxy
+
+  # Kleinanzeigen MCP sub-server (Samxel/kleinanzeigen-mcp, proxied by the gateway
+  # under the `kleinanzeigen` namespace -> tools as kleinanzeigen_search_kleinanzeigen, ...).
+  # Upstream has NO auth: no Traefik labels, reachable only from the gateway over
+  # the internal docker network. Source is pinned to a commit (see Dockerfile).
+  kleinanzeigen-mcp:
+    build: ./kleinanzeigen-mcp
+    container_name: kleinanzeigen-mcp
+    restart: unless-stopped
+    networks:
+      - traefik-proxy
+
+  # Headless browser sub-server (Playwright MCP, proxied by the gateway under the
+  # `browser` namespace -> tools as browser_navigate, browser_snapshot, ...).
+  # --isolated: in-memory profile, and each MCP session gets its own browser
+  # context, so agents cannot see each other's cookies/logins.
+  # ⚠️ SECURITY: Playwright MCP has NO auth. It lives ONLY on the dedicated
+  # `browser-internal` network (joined by the gateway), never on traefik-proxy.
+  # A browser can reach whatever its network can, so egress to the LAN / host /
+  # other containers is dropped by scripts/browser-firewall.sh (run once with sudo).
+  browser-mcp:
+    # pinned to the digest pulled on 2026-10-28 (was :latest)
+    image: mcr.microsoft.com/playwright/mcp@sha256:690763cbb437ee7233f538a953bb5390bf03791eb5c965b471e59d17a6132fcb
+    container_name: browser-mcp
+    restart: unless-stopped
+    # image entrypoint already passes: --headless --browser chromium --no-sandbox
+    command: ["--isolated", "--host", "0.0.0.0", "--port", "8931", "--allowed-hosts", "browser-mcp:8931"]
+    init: true
+    shm_size: 1gb
+    mem_limit: 4g
+    pids_limit: 512
+    networks:
+      browser-internal:
+        # fixed IP: the firewall script matches ONLY this address (the gateway
+        # shares the subnet and must not be filtered)
+        ipv4_address: 10.250.250.10
+
+  # Google Health MCP sub-server (google-health-mcp-unofficial, proxied by the
+  # gateway under the `fitbit` namespace -> tools as fitbit_google_health_*).
+  # ⚠️ SECURITY: upstream HTTP mode has NO Bearer auth -> NEVER on traefik-proxy,
+  # NEVER LAN-reachable. Reachable ONLY via the dedicated `health-internal`
+  # network joined by the gateway, plus a LOOPBACK-ONLY host publish (127.0.0.1)
+  # for the headless OAuth flow (see google-health-mcp/SETUP.md).
+  # Reuses the SAME Google OAuth client as the gateway's gmail/workspace-mcp
+  # (GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET from .env).
+  #
+  # NOTE ON NETWORKING: In Docker, a network with `internal: true` prevents ALL
+  # egress outside the bridge (no default gateway / no NAT). google-health-mcp
+  # MUST have outbound internet access to exchange OAuth tokens with Google
+  # (oauth2.googleapis.com) and query the Google Health API (health.googleapis.com).
+  # Leaving `internal: false` (default) provides standard outbound internet access
+  # while keeping the network unexposed to traefik-proxy or LAN (no inbound traffic).
+  google-health-mcp:
+    build: ./google-health-mcp
+    container_name: google-health-mcp
+    restart: unless-stopped
+    environment:
+      - GOOGLE_HEALTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}
+      - GOOGLE_HEALTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET}
+      - GOOGLE_HEALTH_REDIRECT_URI=http://127.0.0.1:3000/callback
+      - GOOGLE_HEALTH_TOKEN_PATH=/app/data/tokens.json
+      - GOOGLE_HEALTH_CACHE_PATH=/app/data/cache.sqlite
+      # NOTE: the server does NOT expand scope presets (e.g. "full") from this
+      # env var - it only splits on spaces/commas. A literal "full" is sent to
+      # Google as scope=full -> invalid_scope -> browser hangs at consent confirm.
+      - GOOGLE_HEALTH_SCOPES=https://www.googleapis.com/auth/googlehealth.profile.readonly https://www.googleapis.com/auth/googlehealth.settings.readonly https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly https://www.googleapis.com/auth/googlehealth.sleep.readonly https://www.googleapis.com/auth/googlehealth.nutrition.readonly
+    volumes:
+      - health-mcp-data:/app/data
+    # Loopback-only publish: the auth CLI binds 127.0.0.1:3000 inside the
+    # container and waits for Google's redirect; reached by the user browser
+    # via `ssh -L 3000:127.0.0.1:3000 <docker-host>`.
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - health-internal
+
+networks:
+  traefik-proxy:
+    external: true
+  # Private network for the google-health-mcp sub-server and the gateway.
+  # Not exposed to Traefik, but allows outbound traffic to Google APIs.
+  health-internal:
+    internal: false
+  # Private network for browser-mcp and the gateway. Fixed subnet so
+  # scripts/browser-firewall.sh can restrict its egress (internet only, no LAN).
+  browser-internal:
+    ipam:
+      config:
+        - subnet: 10.250.250.0/24
+
+volumes:
+  ha-mcp-data:
+  health-mcp-data:
